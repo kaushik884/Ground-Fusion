@@ -357,6 +357,7 @@ public:
 
     bool initFirstPoseFlag;
     bool wheelanomaly;
+    double wheel_discrepancy;
     bool visualstationary;
     bool varstationary;
     bool preintegrationstationary;

@@ -8,6 +8,7 @@
  *******************************************************/
 
 #include "estimator.h"
+#include <chrono>
 #include "../utility/visualization.h"
 #include "../factor/pose_subset_parameterization.h"
 #include "../factor/orientation_subset_parameterization.h"
@@ -627,13 +628,9 @@ void Estimator::processMeasurements()
                 }
 
                 double dis = (dP_wheel - dP_imu).norm();
+                wheel_discrepancy = dis;
+                printf("wheel_dis: %.4f\n", dis);
                 // cout << "imu wheel dis:" << dis << endl;
-
-                // << endl;
-                if (dis > 0.02 and wdetect) // 0015 for anomaly good
-                {
-                    wheelanomaly = true;
-                }
 
                 if (dP_wheel.norm() < 0.001)
                 { // lower than 0.002
@@ -1120,13 +1117,6 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             {
                 updateGNSSStatistics();
             }
-        }
-        if (!USE_MCC)
-        {
-            set<int> removeIndex;
-            // outliersRejection(removeIndex);
-            movingConsistencyCheckW(removeIndex);
-            f_manager.removeOutlier(removeIndex);
         }
 
         if (!MULTIPLE_THREAD)
@@ -3129,10 +3119,12 @@ void Estimator::optimization()
                 continue;
             }
 
-            if (wdetect && wheelanomaly)
+            if (wdetect && wheel_discrepancy > 0.0)
             {
-                ROS_WARN("wheel anomaly, skip optimization!");
-                continue;
+                const double alpha = 22500.0;
+                double scale = 1.0 + alpha * wheel_discrepancy * wheel_discrepancy;
+                pre_integrations_wheel[j]->covariance *= scale;
+                printf("wheel soft gate: dis=%.4f scale=%.1f\n", wheel_discrepancy, scale);
             }
 
             WheelFactor *wheel_factor = new WheelFactor(pre_integrations_wheel[j]);
@@ -3155,7 +3147,7 @@ void Estimator::optimization()
         for (int i = 0; i < frame_count; i++)
         {
             PlaneFactor *plane_factor = new PlaneFactor();
-            problem.AddResidualBlock(plane_factor, NULL, para_Pose[i], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]);
+            problem.AddResidualBlock(plane_factor, new ceres::CauchyLoss(1.0), para_Pose[i], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]);
 
             //            std::vector<const double *> parameters(4);
             //            parameters[0] = para_Pose[i];
@@ -3315,7 +3307,12 @@ void Estimator::optimization()
         options.max_solver_time_in_seconds = SOLVER_TIME;
     TicToc t_solver;
     ceres::Solver::Summary summary;
+    auto _t0 = std::chrono::high_resolution_clock::now();
     ceres::Solve(options, &problem, &summary);
+    auto _t1 = std::chrono::high_resolution_clock::now();
+    printf("[SOLVE_TIME] main_opt ms=%.3f iters=%d\n",
+           std::chrono::duration<double, std::milli>(_t1 - _t0).count(),
+           static_cast<int>(summary.iterations.size()));
     // cout << summary.BriefReport() << endl;
     ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
     // printf("solver costs: %f \n", t_solver.toc());
@@ -3367,7 +3364,7 @@ void Estimator::optimization()
 
         if (USE_WHEEL && !ONLY_INITIAL_WITH_WHEEL) // && is_imu_excited) //(solver_flag == NON_LINEAR ||is_imu_excited)
         {
-            if (pre_integrations_wheel[1]->sum_dt < 10.0 && !(wdetect && wheelanomaly))
+            if (pre_integrations_wheel[1]->sum_dt < 10.0)
             {
                 WheelFactor *wheel_factor = new WheelFactor(pre_integrations_wheel[1]);
                 ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(wheel_factor, NULL,
@@ -3380,7 +3377,7 @@ void Estimator::optimization()
         if (USE_PLANE)
         {
             PlaneFactor *plane_factor = new PlaneFactor();
-            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(plane_factor, NULL,
+            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(plane_factor, new ceres::CauchyLoss(1.0),
                                                                            vector<double *>{para_Pose[0], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]},
                                                                            vector<int>{0}); // 边缘化 para_Pose[0]
             marginalization_info->addResidualBlockInfo(residual_block_info);
@@ -3967,6 +3964,15 @@ void Estimator::outliersRejection(set<int> &removeIndex)
 
 void Estimator::movingConsistencyCheckW(set<int> &removeIndex)
 {
+    struct FeatureErr
+    {
+        int feature_id;
+        double avg2D;
+        double avg3D;
+    };
+    vector<FeatureErr> featureErrs;
+
+    // Pass 1: collect per-feature average errors
     for (auto &it_per_id : f_manager.feature)
     {
         it_per_id.used_num = it_per_id.feature_per_frame.size();
@@ -3990,25 +3996,60 @@ void Estimator::movingConsistencyCheckW(set<int> &removeIndex)
                 Vector3d pts_j = it_per_frame.point;
                 err += reprojectionError(Rs[wheel_i], Ps[wheel_i], ric[0], tic[0], Rs[wheel_j], Ps[wheel_j],
                                          ric[0], tic[0], depth, pts_i, pts_j);
-                // for bleeding points
                 err3D += reprojectionError3D(Rs[wheel_i], Ps[wheel_i], ric[0], tic[0], Rs[wheel_j],
                                              Ps[wheel_j], ric[0], tic[0], depth, pts_i, pts_j);
                 errCnt++;
             }
         }
         if (errCnt > 0)
+            featureErrs.push_back({it_per_id.feature_id, FOCAL_LENGTH * err / errCnt, err3D / errCnt});
+    }
+
+    if (featureErrs.empty())
+        return;
+
+    // Pass 2: compute mu/sigma, one reweighting iteration to prevent masking
+    double sum = 0;
+    for (auto &fe : featureErrs)
+        sum += fe.avg2D;
+    double mu = sum / featureErrs.size();
+
+    double sq_sum = 0;
+    for (auto &fe : featureErrs)
+        sq_sum += (fe.avg2D - mu) * (fe.avg2D - mu);
+    double sigma = sqrt(sq_sum / featureErrs.size());
+
+    double threshold = mu + 3.0 * sigma;
+    double sum2 = 0, sq_sum2 = 0;
+    int inlierCnt = 0;
+    for (auto &fe : featureErrs)
+    {
+        if (fe.avg2D < threshold)
         {
-            if (FOCAL_LENGTH * err / errCnt > 10 || err3D / errCnt > 2.0)
-            {
-                removeIndex.insert(it_per_id.feature_id);
-                // it_per_id.is_dynamic = true;
-            }
-            // else
-            // {
-            //     it_per_id.is_dynamic = false;
-            // }
+            sum2 += fe.avg2D;
+            sq_sum2 += fe.avg2D * fe.avg2D;
+            inlierCnt++;
         }
     }
+    if (inlierCnt > 1)
+    {
+        mu = sum2 / inlierCnt;
+        sigma = sqrt(sq_sum2 / inlierCnt - mu * mu);
+    }
+    double adaptive_threshold = mu + 3.0 * sigma;
+
+    // Pass 3: reject features exceeding adaptive 2D threshold or fixed 3D threshold
+    int rejectCnt = 0;
+    for (auto &fe : featureErrs)
+    {
+        if (fe.avg2D > adaptive_threshold || fe.avg3D > 2.0)
+        {
+            removeIndex.insert(fe.feature_id);
+            rejectCnt++;
+        }
+    }
+    printf("MCC adaptive: n=%zu mu=%.2f sigma=%.2f thresh=%.2f rejected=%d\n",
+           featureErrs.size(), mu, sigma, adaptive_threshold, rejectCnt);
 }
 
 void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity)
@@ -4261,7 +4302,12 @@ void Estimator::onlyLineOpt()
     // options.trust_region_strategy_type = ceres::DOGLEG;
     options.max_num_iterations = NUM_ITERATIONS;
     ceres::Solver::Summary summary;
+    auto _t0 = std::chrono::high_resolution_clock::now();
     ceres::Solve(options, &problem, &summary);
+    auto _t1 = std::chrono::high_resolution_clock::now();
+    printf("[SOLVE_TIME] init_opt ms=%.3f iters=%d\n",
+           std::chrono::duration<double, std::milli>(_t1 - _t0).count(),
+           static_cast<int>(summary.iterations.size()));
 
     double2vectorline();
     // std::cout << summary.FullReport()<<std::endl;
@@ -4458,7 +4504,7 @@ void Estimator::optimizationwithLine()
         for (int i = 0; i < frame_count; i++)
         {
             PlaneFactor *plane_factor = new PlaneFactor();
-            problem.AddResidualBlock(plane_factor, NULL, para_Pose[i], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]);
+            problem.AddResidualBlock(plane_factor, new ceres::CauchyLoss(1.0), para_Pose[i], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]);
 
             //            std::vector<const double *> parameters(4);
             //            parameters[0] = para_Pose[i];
@@ -4563,7 +4609,12 @@ void Estimator::optimizationwithLine()
         options.max_solver_time_in_seconds = SOLVER_TIME;
     TicToc t_solver;
     ceres::Solver::Summary summary;
+    auto _t0 = std::chrono::high_resolution_clock::now();
     ceres::Solve(options, &problem, &summary);
+    auto _t1 = std::chrono::high_resolution_clock::now();
+    printf("[SOLVE_TIME] main_opt ms=%.3f iters=%d\n",
+           std::chrono::duration<double, std::milli>(_t1 - _t0).count(),
+           static_cast<int>(summary.iterations.size()));
     // cout << summary.BriefReport() << endl;
     ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
     // printf("solver costs: %f \n", t_solver.toc());
@@ -4619,7 +4670,7 @@ void Estimator::optimizationwithLine()
 
         if (USE_WHEEL && !ONLY_INITIAL_WITH_WHEEL) // && is_imu_excited) //(solver_flag == NON_LINEAR ||is_imu_excited)
         {
-            if (pre_integrations_wheel[1]->sum_dt < 10.0 && !(wdetect && wheelanomaly))
+            if (pre_integrations_wheel[1]->sum_dt < 10.0)
             {
                 WheelFactor *wheel_factor = new WheelFactor(pre_integrations_wheel[1]);
                 ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(wheel_factor, NULL,
@@ -4632,7 +4683,7 @@ void Estimator::optimizationwithLine()
         if (USE_PLANE)
         {
             PlaneFactor *plane_factor = new PlaneFactor();
-            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(plane_factor, NULL,
+            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(plane_factor, new ceres::CauchyLoss(1.0),
                                                                            vector<double *>{para_Pose[0], para_Ex_Pose_wheel[0], para_plane_R[0], para_plane_Z[0]},
                                                                            vector<int>{0});
             marginalization_info->addResidualBlockInfo(residual_block_info);
